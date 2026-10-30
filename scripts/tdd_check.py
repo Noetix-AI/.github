@@ -24,7 +24,9 @@ from pathlib import Path
 DEFAULT_CODE_GLOBS = "**/*.py"
 DEFAULT_TEST_GLOBS = "tests/**,**/test_*.py,**/*_test.py,**/conftest.py"
 DEFAULT_RUNNABLE_GLOBS = "**/test_*.py,**/*_test.py"
-IMPORT_RE = re.compile(r"\b(ModuleNotFoundError|ImportError)\b")
+IMPORT_RE = re.compile(r"^(?:E\s+)?(?:ModuleNotFoundError|ImportError)(?::|$)", re.MULTILINE)
+PYTHON_RE = re.compile(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?\Z")
+PYTEST_PROGRAMS = ("pytest", "py.test", "pytest.exe", "py.test.exe")
 OUTPUT_TAIL = 150
 
 
@@ -99,8 +101,12 @@ def parse_junit(path):
         if problem is None:
             kind = "skipped" if case.find("skipped") is not None else "passed"
         else:
-            text = (problem.get("message") or "") + "\n" + (problem.text or "")
-            if IMPORT_RE.search(text):
+            message = re.sub(r"^failed on (?:setup|teardown) with [\"']", "",
+                             problem.get("message") or "")
+            actual_type = (problem.get("type") or "").rsplit(".", 1)[-1]
+            if (actual_type in ("ImportError", "ModuleNotFoundError")
+                    or IMPORT_RE.match(message)
+                    or (error is not None and IMPORT_RE.search(problem.text or ""))):
                 kind = "import"
             elif failure is not None:
                 kind = "failed"
@@ -114,19 +120,40 @@ def test_argv(command, python=None):
     cmd = shlex.split(command)
     if python:
         program = os.path.basename(cmd[0]) if cmd else ""
-        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", program):
+        if PYTHON_RE.fullmatch(program):
             cmd[0] = python
-        elif program in ("pytest", "py.test", "pytest.exe", "py.test.exe"):
+        elif program in PYTEST_PROGRAMS:
             cmd = [python, "-m", "pytest", *cmd[1:]]
         else:
             raise ValueError("隔离环境只支持以 Python 或 pytest 开始的 test-command")
     return cmd
 
 
+def is_pytest_command(cmd):
+    if not cmd:
+        return False
+    program = os.path.basename(cmd[0])
+    if program in PYTEST_PROGRAMS:
+        return True
+    if not PYTHON_RE.fullmatch(program):
+        return False
+    index = 1
+    while index < len(cmd):
+        option = cmd[index]
+        if option == "-m":
+            return index + 1 < len(cmd) and cmd[index + 1] == "pytest"
+        if option in ("-c", "--") or not option.startswith("-"):
+            return False
+        index += 2 if option in ("-W", "-X", "--check-hash-based-pycs") else 1
+    return False
+
+
 def run_tests(command, paths, cwd, env=None, python=None):
-    cmd = test_argv(command, python) + list(paths)
+    cmd = test_argv(command, python)
+    pytest_command = is_pytest_command(cmd)
+    cmd += list(paths)
     junit = None
-    if "pytest" in command:
+    if pytest_command:
         fd, junit = tempfile.mkstemp(suffix=".xml", prefix="tdd-junit-")
         os.close(fd)
         os.unlink(junit)

@@ -162,6 +162,25 @@ class TddCheckTests(unittest.TestCase):
         self.assert_result(proc, text, passed=False)
         self.assertIn("只有 import 错误", text)
 
+    def test_missing_expected_import_error_is_behavior_failure(self):
+        self.repo.write("calc.py", BASE_CODE + "\ndef optional_backend():\n    return None\n")
+        self.base = self.repo.commit("missing required error behavior")
+        for error in ("ImportError", "ModuleNotFoundError"):
+            with self.subTest(error=error):
+                self.repo.write("calc.py", BASE_CODE + f"\ndef optional_backend():\n    raise {error}('backend unavailable')\n")
+                self.repo.write("tests/test_backend.py", f"""\
+                    import pytest
+                    from calc import optional_backend
+
+                    def test_required_error():
+                        with pytest.raises({error}):
+                            optional_backend()
+                    """)
+                self.repo.commit("raise expected backend error")
+                proc, text = self.run_check()
+                self.assert_result(proc, text, passed=True)
+                self.assertIn("DID NOT RAISE", text)
+
     def test_behavior_failure_plus_import_error_passes_and_lists_both(self):
         self.repo.write("calc.py", BASE_CODE + "\ndef sub(a, b):\n    return a - b\n")
         self.repo.write("mul.py", "def mul(a, b):\n    return a * b\n")
@@ -374,6 +393,26 @@ class TddCheckTests(unittest.TestCase):
         self.assertFalse(rep.failed, rep.render())
         self.assertEqual(len(installs), 2, rep.render())
         self.assertEqual(imports, [str(Path(item["source"]) / "tdd_probe/__init__.py") for item in installs])
+
+    def test_py_test_alias_cannot_hide_failed_then_skipped_test(self):
+        self.prepare_installed_source_change()
+        self.repo.write("tests/test_probe.py", """\
+            import pytest
+            from tdd_probe import value
+
+            def test_new_behavior():
+                if value() == 2:
+                    pytest.skip("verification unavailable")
+                assert value() == 2
+
+            def test_other():
+                assert True
+            """)
+        self.repo.commit("py.test alias must retain per-case recovery evidence")
+        rep, installs, imports = self.run_installed_check("py.test -q -p no:cacheprovider")
+        self.assertTrue(rep.failed, rep.render())
+        self.assertIn("没有实际通过", rep.render())
+        self.assertIn("test_new_behavior", rep.render())
 
     def test_failed_environment_install_does_not_run_or_count_as_failed_test(self):
         self.prepare_installed_source_change()
