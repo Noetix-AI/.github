@@ -104,7 +104,12 @@ def parse_junit(path):
             message = re.sub(r"^failed on (?:setup|teardown) with [\"']", "",
                              problem.get("message") or "")
             actual_type = (problem.get("type") or "").rsplit(".", 1)[-1]
-            if (actual_type in ("ImportError", "ModuleNotFoundError")
+            # unittest subTest reports can share one XML testcase. The hook
+            # records their actual exceptions/stages before traceback rendering.
+            outcome = case.find("./properties/property[@name='tdd-unittest-outcome']")
+            if outcome is not None and outcome.get("value") in ("failed", "import", "error"):
+                kind = outcome.get("value")
+            elif (actual_type in ("ImportError", "ModuleNotFoundError")
                     or IMPORT_RE.match(message)
                     or (error is not None and IMPORT_RE.search(problem.text or ""))):
                 kind = "import"
@@ -129,42 +134,52 @@ def test_argv(command, python=None):
     return cmd
 
 
-def is_pytest_command(cmd):
+def pytest_python_entry(cmd):
+    """定位真正的 -m pytest，保留解释器及其选项（包括组合短选项）。"""
     if not cmd:
-        return False
+        return None
     program = os.path.basename(cmd[0])
-    if program in PYTEST_PROGRAMS:
-        return True
     if not PYTHON_RE.fullmatch(program):
-        return False
+        return None
     index = 1
     while index < len(cmd):
+        option_index = index
         option = cmd[index]
         index += 1
         if option == "--check-hash-based-pycs":
             if index >= len(cmd) or cmd[index] not in ("always", "default", "never"):
-                return False
+                return None
             index += 1
             continue
         if not option.startswith("-") or option in ("-", "--") or option.startswith("--"):
-            return False
+            return None
         # CPython 短选项可组合；c/m/W/X 消费本 token 剩余部分，或下一个完整 token。
         for offset, flag in enumerate(option[1:], 1):
             if flag in "cmWX":
                 argument = option[offset + 1:]
                 if not argument:
                     if index >= len(cmd):
-                        return False
+                        return None
                     argument = cmd[index]
                     index += 1
                 if flag == "m":
-                    return argument in ("pytest", "pytest.__main__")
+                    if argument not in ("pytest", "pytest.__main__"):
+                        return None
+                    prefix = cmd[:option_index]
+                    if offset > 1:
+                        prefix.append(option[:offset])
+                    return prefix, cmd[index:]
                 if flag == "c":
-                    return False
+                    return None
                 break
             if flag not in "bBdEiIOPqRsStuvx":
-                return False  # 含帮助 / 版本、未知选项时 Python 不会运行后面的模块。
-    return False
+                return None  # 含帮助 / 版本、未知选项时 Python 不会运行后面的模块。
+    return None
+
+
+def is_pytest_command(cmd):
+    return bool(cmd) and (os.path.basename(cmd[0]) in PYTEST_PROGRAMS
+                          or pytest_python_entry(cmd) is not None)
 
 
 def run_tests(command, paths, cwd, env=None, python=None):
@@ -179,7 +194,23 @@ def run_tests(command, paths, cwd, env=None, python=None):
         # 有文件 import 失败时 pytest 默认整轮中止，其他文件里的行为失败就看不到了
         cmd += [f"--junitxml={junit}", "--continue-on-collection-errors"]
     env = {**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"}
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
+    execution = cmd
+    if pytest_command:
+        plugin = Path(__file__).resolve().with_name("tdd_pytest_plugin.py")
+        entry = pytest_python_entry(cmd)
+        if entry is not None:
+            prefix, pytest_args = entry
+            # 在原解释器中载入单个受控插件；不向各阶段 venv 注入宿主包路径。
+            bootstrap = ("import runpy,sys,pytest; "
+                         "plugin=runpy.run_path(sys.argv[1]); "
+                         "raise SystemExit(pytest.main(sys.argv[2:], plugins=[plugin['LifecyclePlugin']()]))")
+            execution = prefix + ["-c", bootstrap, str(plugin), *pytest_args]
+        else:
+            # 本地未配置 install-command 的 pytest 可执行文件，保留其原有解释器。
+            # 隔离 venv 路径已由 test_argv 归一为上面的 Python 分支。
+            env["PYTHONPATH"] = os.pathsep.join(filter(None, (str(plugin.parent), env.get("PYTHONPATH"))))
+            execution = cmd + ["-p", "tdd_pytest_plugin"]
+    proc = subprocess.run(execution, cwd=cwd, capture_output=True, text=True, env=env)
     output = proc.stdout + proc.stderr
     cases = []
     if junit and os.path.exists(junit):
