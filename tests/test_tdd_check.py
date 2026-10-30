@@ -13,6 +13,8 @@ import venv
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tdd_check.py"
 PYTEST = f'"{sys.executable}" -m pytest -q -p no:cacheprovider'
 
@@ -357,12 +359,30 @@ class TddCheckTests(unittest.TestCase):
         )
         install_log = Path(self.tmp.name) / "installs.jsonl"
         test_log = Path(self.tmp.name) / "test-imports.txt"
-        # 仅测试 fixture 注入当前已安装的 pytest，生产 builder 仍须隔离系统包。
+        # 仅 fixture 显式提供当前测试进程的依赖；嵌套 venv 不会继承外层 venv 的包。
         real_builder = venv.EnvBuilder
+        dependency_sites = {str(Path(pytest.__file__).resolve().parent.parent)}
+        dependency_sites.update(
+            str(Path(path).resolve()) for path in sys.path
+            if Path(path).name in ("site-packages", "dist-packages") and Path(path).is_dir()
+        )
+
+        class OfflineBuilder(real_builder):
+            def create(builder, directory):
+                super().create(directory)
+                context = builder.ensure_directories(directory)
+                query_env = {key: value for key, value in os.environ.items()
+                             if key not in ("PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__")}
+                purelib = subprocess.check_output(
+                    [context.env_exe, "-I", "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"],
+                    env=query_env, text=True).strip()
+                self.assertIn(Path(directory).resolve(), Path(purelib).resolve().parents)
+                Path(purelib, "fixture-test-dependencies.pth").write_text(
+                    "\n".join(sorted(dependency_sites)) + "\n", encoding="utf-8")
 
         def offline_builder(*positional, **kwargs):
             self.assertFalse(kwargs.get("system_site_packages", False))
-            return real_builder(*positional, **{**kwargs, "system_site_packages": True})
+            return OfflineBuilder(*positional, **kwargs)
 
         with mock.patch.object(venv, "EnvBuilder", side_effect=offline_builder), mock.patch.dict(
             os.environ, {"PYTHONPATH": str(self.repo.root / "src"), "PYTHONHOME": "",
