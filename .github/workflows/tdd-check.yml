@@ -21,7 +21,7 @@ on:
         type: string
         default: "**/test_*.py,**/*_test.py"
       test-command:
-        description: 测试命令（含 pytest 时自动加 --junitxml 逐条分类失败 / import 错误）
+        description: Python / pytest 测试命令，使用每阶段 venv 的解释器（含绝对 Python / pytest 路径）；pytest 自动加 JUnit
         type: string
         default: "python -m pytest"
       head-test-paths:
@@ -40,7 +40,7 @@ on:
         type: string
         default: "3.12"
       install-command:
-        description: 安装测试依赖的命令，在仓库根目录执行
+        description: 在 base / head 各自源码根目录和全新 venv 中执行的 Bash 安装命令；用 python / pip 使用当前 venv
         type: string
         default: "python -m pip install pytest"
       tools-ref:
@@ -74,9 +74,6 @@ jobs:
         with:
           python-version: ${{ inputs.python-version }}
 
-      - name: 安装测试依赖
-        run: ${{ inputs.install-command }}
-
       - name: 测试先行检查
         env:
           BASE: ${{ github.event.pull_request.base.sha }}
@@ -86,6 +83,7 @@ jobs:
           TEST_GLOBS: ${{ inputs.test-globs }}
           RUNNABLE_GLOBS: ${{ inputs.runnable-test-globs }}
           TEST_COMMAND: ${{ inputs.test-command }}
+          INSTALL_COMMAND: ${{ inputs.install-command }}
           HEAD_TEST_PATHS: ${{ inputs.head-test-paths }}
           SKIP_LABEL: ${{ inputs.skip-label }}
           ALLOW_IMPORT_ONLY: ${{ inputs.allow-import-only }}
@@ -99,4 +97,5 @@ jobs:
             --base "$BASE" --head "$HEAD" --labels "$LABELS" --skip-label "$SKIP_LABEL" \
             --code-globs "$CODE_GLOBS" --test-globs "$TEST_GLOBS" \
             --runnable-test-globs "$RUNNABLE_GLOBS" --test-command "$TEST_COMMAND" \
+            --install-command "$INSTALL_COMMAND" \
             --head-test-paths "$HEAD_TEST_PATHS" --summary "$GITHUB_STEP_SUMMARY" "${extra[@]}"

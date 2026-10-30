@@ -1,11 +1,17 @@
 """tdd_check.py 的测试：每个用例在临时 git 仓库里造一对 base / head 提交，再跑检查脚本。"""
+import argparse
+import importlib.util
+import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
 import textwrap
 import unittest
+import venv
 from pathlib import Path
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "tdd_check.py"
 PYTEST = f'"{sys.executable}" -m pytest -q -p no:cacheprovider'
@@ -228,6 +234,156 @@ class TddCheckTests(unittest.TestCase):
         proc, text = self.run_check("--head-test-paths", "tests")
         self.assert_result(proc, text, passed=False)
         self.assertIn("改动后测试未通过", text)
+
+    def test_head_test_paths_cannot_omit_changed_tests(self):
+        self.repo.write("calc.py", BASE_CODE + "\ndef sub(a, b):\n    return 0\n")
+        self.repo.write("tests/test_sub.py", """\
+            import calc
+
+            def test_sub():
+                assert hasattr(calc, "sub") and calc.sub(3, 1) == 2
+            """)
+        self.repo.commit("broken behavior outside configured head suite")
+        proc, text = self.run_check("--head-test-paths", "tests/test_add.py")
+        self.assert_result(proc, text, passed=False)
+        self.assertIn("test_sub", text)
+
+    def test_failure_on_base_then_skip_on_head_is_not_passed_evidence(self):
+        self.repo.write("calc.py", BASE_CODE + "\nFEATURE_READY = True\n")
+        self.repo.write("tests/test_feature.py", """\
+            import pytest
+            import calc
+
+            def test_feature():
+                if getattr(calc, "FEATURE_READY", False):
+                    pytest.skip("feature is covered by an unavailable integration service")
+                assert getattr(calc, "FEATURE_READY", False)
+
+            def test_other():
+                assert calc.add(1, 2) == 3
+            """)
+        self.repo.commit("feature with skipped verification")
+        proc, text = self.run_check()
+        self.assert_result(proc, text, passed=False)
+        self.assertIn("test_feature", text)
+
+    def test_quoted_code_filename_cannot_bypass_missing_test_check(self):
+        self.repo.git("config", "core.quotePath", "true")
+        for filename in ("统计.py", "has\ttab.py", "line\nbreak.py"):
+            with self.subTest(filename=filename):
+                self.repo.write("tools/" + filename, "VALUE = 2\n")
+                self.repo.commit("code only with a quoted path")
+                proc, text = self.run_check()
+                self.assert_result(proc, text, passed=False)
+                self.assertIn("改了代码但没有改测试", text)
+
+    def test_pytest_startup_error_is_not_behavior_failure(self):
+        self.repo.write("pytest.ini", "[pytest]\naddopts = --missing-option\n")
+        self.base = self.repo.commit("old environment has invalid pytest option")
+        self.repo.write("pytest.ini", "[pytest]\n")
+        self.repo.write("calc.py", BASE_CODE.replace("a + b", "abs(a + b)"))
+        self.repo.write("tests/test_positive.py", """\
+            from calc import add
+
+            def test_positive():
+                assert add(2, 3) == 5
+            """)
+        self.repo.commit("test passes old behavior but old pytest cannot start")
+        proc, text = self.run_check()
+        self.assert_result(proc, text, passed=False)
+
+    def prepare_installed_source_change(self):
+        """离线安装器写真实 .pth，等价于 editable 的源码路径，不需要下载构建工具。"""
+        self.repo.write("src/tdd_probe/__init__.py", "def value():\n    return 1\n")
+        self.repo.write("install_source.py", """\
+            import json
+            import os
+            from pathlib import Path
+            import sys
+            import sysconfig
+
+            assert sys.prefix != sys.base_prefix, "must install inside a venv"
+            assert "PYTHONPATH" not in os.environ
+            assert "PYTHONHOME" not in os.environ
+            source = str(Path.cwd() / "src")
+            Path(sysconfig.get_path("purelib"), "tdd-probe.pth").write_text(source + "\\n")
+            with open(os.environ["TDD_INSTALL_LOG"], "a") as stream:
+                stream.write(json.dumps({"source": source, "prefix": sys.prefix}) + "\\n")
+            """)
+        self.base = self.repo.commit("src-layout project before behavior change")
+        self.repo.write("src/tdd_probe/__init__.py", "def value():\n    return 2\n")
+        self.repo.write("tests/test_probe.py", """\
+            import os
+            from pathlib import Path
+            import sys
+            import tdd_probe
+
+            def test_new_behavior():
+                with open(os.environ["TDD_TEST_LOG"], "a") as stream:
+                    stream.write(str(Path(tdd_probe.__file__).resolve()) + "\\n")
+                assert tdd_probe.value() == 2
+            """)
+        self.repo.commit("new behavior and regression")
+
+    def run_installed_check(self, test_command=PYTEST, install_command="python install_source.py"):
+        spec = importlib.util.spec_from_file_location("isolated_tdd_check", SCRIPT)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        args = argparse.Namespace(
+            repo=str(self.repo.root), base=self.base, head=self.repo.git("rev-parse", "HEAD"),
+            labels="", skip_label="no-test-needed", code_globs=checker.DEFAULT_CODE_GLOBS,
+            test_globs=checker.DEFAULT_TEST_GLOBS, runnable_globs=checker.DEFAULT_RUNNABLE_GLOBS,
+            test_command=test_command, head_test_paths="", allow_import_only=False,
+            install_command=install_command,
+        )
+        install_log = Path(self.tmp.name) / "installs.jsonl"
+        test_log = Path(self.tmp.name) / "test-imports.txt"
+        # 仅测试 fixture 注入当前已安装的 pytest，生产 builder 仍须隔离系统包。
+        real_builder = venv.EnvBuilder
+
+        def offline_builder(*positional, **kwargs):
+            self.assertFalse(kwargs.get("system_site_packages", False))
+            return real_builder(*positional, **{**kwargs, "system_site_packages": True})
+
+        with mock.patch.object(venv, "EnvBuilder", side_effect=offline_builder), mock.patch.dict(
+            os.environ, {"PYTHONPATH": str(self.repo.root / "src"), "PYTHONHOME": "",
+                         "TDD_INSTALL_LOG": str(install_log), "TDD_TEST_LOG": str(test_log)}
+        ):
+            rep = checker.check(args)
+        installs = [json.loads(line) for line in install_log.read_text().splitlines()] if install_log.exists() else []
+        imports = test_log.read_text().splitlines() if test_log.exists() else []
+        return rep, installs, imports
+
+    def test_installed_src_project_uses_separate_base_and_head_environments(self):
+        self.prepare_installed_source_change()
+        rep, installs, imports = self.run_installed_check()
+        self.assertFalse(rep.failed, rep.render())
+        self.assertEqual(len(installs), 2, rep.render())
+        self.assertNotEqual(installs[0]["prefix"], installs[1]["prefix"])
+        self.assertNotEqual(installs[0]["source"], installs[1]["source"])
+        self.assertEqual(Path(installs[1]["source"]), (self.repo.root / "src").resolve())
+        self.assertEqual(imports, [str(Path(item["source"]) / "tdd_probe/__init__.py") for item in installs])
+
+    def test_absolute_pytest_launcher_uses_isolated_interpreter(self):
+        self.prepare_installed_source_change()
+        launcher = Path(self.tmp.name) / "host-bin" / "pytest"
+        launcher.parent.mkdir()
+        launcher.write_text(f"#!{sys.executable}\nimport pytest\nraise SystemExit(pytest.console_main())\n")
+        launcher.chmod(0o755)
+        rep, installs, imports = self.run_installed_check(shlex.quote(str(launcher)) + " -q")
+        self.assertFalse(rep.failed, rep.render())
+        self.assertEqual(len(installs), 2, rep.render())
+        self.assertEqual(imports, [str(Path(item["source"]) / "tdd_probe/__init__.py") for item in installs])
+
+    def test_failed_environment_install_does_not_run_or_count_as_failed_test(self):
+        self.prepare_installed_source_change()
+        for command in ("python -c 'raise SystemExit(13)'", "false | true\npython install_source.py"):
+            with self.subTest(command=command):
+                rep, installs, imports = self.run_installed_check(install_command=command)
+                self.assertTrue(rep.failed, rep.render())
+                self.assertEqual(imports, [], "tests must not run after installation failed")
+                self.assertIn("环境安装", rep.render())
+                self.assertNotIn("改动前有测试因行为不符而失败", rep.render())
 
 
 class GlobTests(unittest.TestCase):

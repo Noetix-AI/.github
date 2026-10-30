@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import venv
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -70,20 +71,18 @@ def git(repo, *args):
 
 def changed_files(repo, base, head):
     """返回 [(状态, 路径)]，改名拆成删 + 增。"""
-    out = git(repo, "diff", "--name-status", "--no-renames", base, head)
-    result = []
-    for line in out.splitlines():
-        status, _, path = line.partition("\t")
-        result.append((status[0], path))
-    return result
+    out = git(repo, "diff", "--name-status", "-z", "--no-renames", base, head)
+    fields = out.split("\0")
+    return [(fields[i][0], fields[i + 1]) for i in range(0, len(fields) - 1, 2)]
 
 
 # ---------- 运行测试 ----------
 
 class RunResult:
-    def __init__(self, cmd, code, output, cases, junit):
+    def __init__(self, cmd, code, output, cases, junit, environment_error=False):
         self.cmd, self.code, self.output, self.junit = cmd, code, output, junit
         self.cases = cases  # [(名字, 类别)]，类别：passed / failed / import / error / skipped
+        self.environment_error = environment_error
 
     def names(self, kind):
         return [n for n, k in self.cases if k == kind]
@@ -111,8 +110,21 @@ def parse_junit(path):
     return cases
 
 
-def run_tests(command, paths, cwd):
-    cmd = shlex.split(command) + list(paths)
+def test_argv(command, python=None):
+    cmd = shlex.split(command)
+    if python:
+        program = os.path.basename(cmd[0]) if cmd else ""
+        if re.fullmatch(r"python(?:\d+(?:\.\d+)*)?(?:\.exe)?", program):
+            cmd[0] = python
+        elif program in ("pytest", "py.test", "pytest.exe", "py.test.exe"):
+            cmd = [python, "-m", "pytest", *cmd[1:]]
+        else:
+            raise ValueError("隔离环境只支持以 Python 或 pytest 开始的 test-command")
+    return cmd
+
+
+def run_tests(command, paths, cwd, env=None, python=None):
+    cmd = test_argv(command, python) + list(paths)
     junit = None
     if "pytest" in command:
         fd, junit = tempfile.mkstemp(suffix=".xml", prefix="tdd-junit-")
@@ -120,7 +132,7 @@ def run_tests(command, paths, cwd):
         os.unlink(junit)
         # 有文件 import 失败时 pytest 默认整轮中止，其他文件里的行为失败就看不到了
         cmd += [f"--junitxml={junit}", "--continue-on-collection-errors"]
-    env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {**(os.environ if env is None else env), "PYTHONDONTWRITEBYTECODE": "1"}
     proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     output = proc.stdout + proc.stderr
     cases = []
@@ -131,7 +143,35 @@ def run_tests(command, paths, cwd):
             cases = []
         os.unlink(junit)
     shown = [c for c in cmd if not c.startswith("--junitxml=") and c != "--continue-on-collection-errors"]
-    return RunResult(shown, proc.returncode, output, cases, bool(cases) or (junit is not None and proc.returncode in (0, 5)))
+    return RunResult(shown, proc.returncode, output, cases, junit is not None)
+
+
+def run_test_stage(args, paths, cwd):
+    """显式安装时，每阶段独立创建 venv；不复用 head 的包或解释器入口。"""
+    if not args.install_command:
+        return run_tests(args.test_command, paths, cwd)
+    with tempfile.TemporaryDirectory(prefix="tdd-env-") as directory:
+        install_cmd = ["bash", "-e", "-o", "pipefail", "-c", args.install_command]
+        try:
+            venv.EnvBuilder(with_pip=True, system_site_packages=False).create(directory)
+            bindir = Path(directory) / ("Scripts" if os.name == "nt" else "bin")
+            python = str(bindir / ("python.exe" if os.name == "nt" else "python"))
+            test_argv(args.test_command, python)  # 不允许绝对宿主解释器逃出 venv。
+            env = dict(os.environ)
+            for key in ("PYTHONPATH", "PYTHONHOME", "__PYVENV_LAUNCHER__"):
+                env.pop(key, None)
+            env.update(VIRTUAL_ENV=directory, PATH=str(bindir) + os.pathsep + env.get("PATH", ""))
+            install = subprocess.run(install_cmd, cwd=cwd, env=env, capture_output=True, text=True)
+            install_output = install.stdout + install.stderr
+            if install.returncode:
+                return RunResult(install_cmd, install.returncode, install_output, [], False,
+                                 environment_error=True)
+            run = run_tests(args.test_command, paths, cwd, env=env, python=python)
+            run.output = (f"环境安装：{args.install_command}\n{install_output}\n" + run.output)
+            return run
+        except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+            return RunResult(install_cmd, 1, f"创建 / 安装 / 启动隔离环境失败：{exc}\n", [], False,
+                             environment_error=True)
 
 
 # ---------- 汇报 ----------
@@ -197,6 +237,7 @@ def check(args):
     runnable = [p for p in tests if match_any(p, runnable_globs)]
 
     # 2. 改动前的代码上运行改动 / 新增的测试
+    base_failed = []
     if not runnable:
         rep.step("改动前先失败", "❌", "改了测试相关文件，但没有可运行的测试文件（按 runnable-test-globs）", fail=True)
     else:
@@ -210,11 +251,12 @@ def check(args):
                 dest = Path(wt) / path
                 dest.parent.mkdir(parents=True, exist_ok=True)
                 dest.write_bytes(data)
-            run = run_tests(args.test_command, runnable, wt)
+            run = run_test_stage(args, runnable, wt)
         finally:
             subprocess.run(["git", "worktree", "remove", "--force", wt], cwd=repo, capture_output=True)
             shutil.rmtree(tmp, ignore_errors=True)
         judge_base(rep, run, args.allow_import_only)
+        base_failed = run.names("failed")
         rep.detail(f"改动前（{base[:8]}）运行改动 / 新增的测试", run)
 
     # 3. head 上运行相关测试
@@ -222,13 +264,31 @@ def check(args):
     if head_sha != git(repo, "rev-parse", args.head):
         rep.step("改动后通过", "❌", f"工作区不在 head（{args.head[:8]}），无法运行", fail=True)
         return rep
-    head_paths = split_list(args.head_test_paths) or runnable
+    # 配置范围可扩大验证，但不能排除本 PR 的测试。
+    head_paths = split_list(args.head_test_paths)
+    for path in runnable:
+        target = (Path(repo) / path).resolve()
+        covered = any(
+            target == (Path(repo) / item).resolve()
+            or ((Path(repo) / item).is_dir() and (Path(repo) / item).resolve() in target.parents)
+            for item in head_paths
+        )
+        if not covered:
+            head_paths.append(path)
     if not head_paths:
         rep.step("改动后通过", "❌", "没有可运行的测试", fail=True)
         return rep
-    run = run_tests(args.test_command, head_paths, repo)
-    if run.code == 0:
-        rep.step("改动后通过", "✅", f"{fmt_list(head_paths, 5)} 全部通过（{len(run.names('passed'))} 个用例）")
+    run = run_test_stage(args, head_paths, repo)
+    if run.environment_error:
+        rep.step("改动后环境安装", "❌", f"隔离环境创建 / 安装 / 启动失败（退出码 {run.code}），"
+                 "没有运行可用于判断的测试", fail=True)
+    elif run.code == 0:
+        recovered = set(base_failed).intersection(run.names("passed"))
+        if base_failed and not recovered:
+            rep.step("改动后通过", "❌", "改动前失败的用例在改动后没有实际通过（可能被跳过或未收集）："
+                     + fmt_list(base_failed), fail=True)
+        else:
+            rep.step("改动后通过", "✅", f"{fmt_list(head_paths, 5)} 全部通过（{len(run.names('passed'))} 个用例）")
     elif run.code == 5:
         rep.step("改动后通过", "❌", f"改动后测试未通过：没有收集到任何测试（{fmt_list(head_paths, 5)}）", fail=True)
     else:
@@ -240,7 +300,15 @@ def check(args):
 
 def judge_base(rep, run, allow_import_only):
     name = "改动前先失败"
+    if run.environment_error:
+        rep.step("改动前环境安装", "❌", f"隔离环境创建 / 安装 / 启动失败（退出码 {run.code}），"
+                 "不能当作行为失败", fail=True)
+        return
     failed, imports, errors = run.names("failed"), run.names("import"), run.names("error")
+    if run.junit and (run.code not in (0, 1, 5) or (run.code == 1 and not run.cases)):
+        rep.step(name, "❌", f"pytest 启动 / 运行异常或缺少有效 JUnit 结果（退出码 {run.code}），"
+                 "不能当作行为失败", fail=True)
+        return
     if not run.cases and run.code not in (0, 5):
         # 不是 pytest 或没产出 junit：只能看退出码和输出
         if IMPORT_RE.search(run.output):
@@ -279,6 +347,8 @@ def main(argv=None):
     ap.add_argument("--runnable-test-globs", dest="runnable_globs", default=DEFAULT_RUNNABLE_GLOBS,
                     help="测试相关文件里可直接交给测试命令的测试文件")
     ap.add_argument("--test-command", default="python -m pytest")
+    ap.add_argument("--install-command", default="",
+                    help="在 base / head 各自的新 venv 和源码目录执行的 Bash 安装命令；留空沿用当前环境")
     ap.add_argument("--head-test-paths", default="", help="head 上运行的测试路径，留空 = 改动 / 新增的测试文件")
     ap.add_argument("--allow-import-only", action="store_true",
                     help="改动前只有 import 错误时记 ⚠️ 通过（默认失败）")
