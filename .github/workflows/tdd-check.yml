@@ -1,0 +1,101 @@
+name: tdd-check
+
+# 可复用的「测试先行」检查（管理者 2026-10-30 定：有行为变化的代码改动走 TDD）。
+# 各仓库在自己的 .github/workflows/ 里用 `uses: Noetix-AI/.github/.github/workflows/tdd-check.yml@main` 调用，
+# 见本仓库 CONTRIBUTING.md「测试驱动开发」。
+# 注意：GitHub Free 的私有仓库开不了分支保护 / ruleset，这个检查只能把 PR 标红，挡不住合并。
+
+on:
+  workflow_call:
+    inputs:
+      code-globs:
+        description: 算「代码」的文件，逗号分隔（** 跨目录；不含 / 的模式匹配任意层文件名）
+        type: string
+        default: "**/*.py"
+      test-globs:
+        description: 算「测试相关」的文件（含 fixtures / conftest），改动前运行时一并带上
+        type: string
+        default: "tests/**,**/test_*.py,**/*_test.py,**/conftest.py"
+      runnable-test-globs:
+        description: 测试相关文件里可直接交给测试命令的测试文件
+        type: string
+        default: "**/test_*.py,**/*_test.py"
+      test-command:
+        description: Python / pytest 测试命令，使用每阶段 venv 的解释器（含绝对 Python / pytest 路径）；pytest 自动加 JUnit
+        type: string
+        default: "python -m pytest"
+      head-test-paths:
+        description: 改动后（head）运行的测试路径，逗号分隔；留空 = 只跑改动 / 新增的测试文件
+        type: string
+        default: ""
+      skip-label:
+        description: 带这个标签的 PR 跳过检查
+        type: string
+        default: "no-test-needed"
+      allow-import-only:
+        description: 改动前只有 import 错误（新模块尚不存在）时记 ⚠️ 通过；默认失败
+        type: boolean
+        default: false
+      python-version:
+        type: string
+        default: "3.12"
+      install-command:
+        description: 在 base / head 各自源码根目录和全新 venv 中执行的 Bash 安装命令；用 python / pip 使用当前 venv
+        type: string
+        default: "python -m pip install pytest"
+      tools-ref:
+        description: 检查脚本取 Noetix-AI/.github 的哪个 ref（一般不用改）
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  tdd:
+    name: 测试先行
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出 PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: 取检查脚本
+        uses: actions/checkout@v4
+        with:
+          repository: Noetix-AI/.github
+          ref: ${{ inputs.tools-ref }}
+          path: .tdd-tools
+          sparse-checkout: scripts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: 测试先行检查
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          CODE_GLOBS: ${{ inputs.code-globs }}
+          TEST_GLOBS: ${{ inputs.test-globs }}
+          RUNNABLE_GLOBS: ${{ inputs.runnable-test-globs }}
+          TEST_COMMAND: ${{ inputs.test-command }}
+          INSTALL_COMMAND: ${{ inputs.install-command }}
+          HEAD_TEST_PATHS: ${{ inputs.head-test-paths }}
+          SKIP_LABEL: ${{ inputs.skip-label }}
+          ALLOW_IMPORT_ONLY: ${{ inputs.allow-import-only }}
+        run: |
+          if [ -z "$BASE" ]; then
+            echo "::error::tdd-check 只支持 pull_request 事件" ; exit 1
+          fi
+          extra=()
+          [ "$ALLOW_IMPORT_ONLY" = "true" ] && extra+=(--allow-import-only)
+          python .tdd-tools/scripts/tdd_check.py --repo . \
+            --base "$BASE" --head "$HEAD" --labels "$LABELS" --skip-label "$SKIP_LABEL" \
+            --code-globs "$CODE_GLOBS" --test-globs "$TEST_GLOBS" \
+            --runnable-test-globs "$RUNNABLE_GLOBS" --test-command "$TEST_COMMAND" \
+            --install-command "$INSTALL_COMMAND" \
+            --head-test-paths "$HEAD_TEST_PATHS" --summary "$GITHUB_STEP_SUMMARY" "${extra[@]}"
