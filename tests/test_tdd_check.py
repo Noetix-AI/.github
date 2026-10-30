@@ -414,6 +414,54 @@ class TddCheckTests(unittest.TestCase):
         self.assertIn("没有实际通过", rep.render())
         self.assertIn("test_new_behavior", rep.render())
 
+    def test_python_module_option_forms_retain_recovery_evidence(self):
+        self.repo.write("calc.py", BASE_CODE + "\nFEATURE_READY = True\n")
+        self.repo.write("tests/test_feature.py", """\
+            import pytest
+            import calc
+
+            def test_feature():
+                if getattr(calc, "FEATURE_READY", False):
+                    pytest.skip("verification unavailable")
+                assert getattr(calc, "FEATURE_READY", False)
+
+            def test_other():
+                assert True
+            """)
+        self.repo.commit("module entry forms must preserve failed-case recovery")
+        for options in (
+            "-m pytest", "-mpytest", "-Bmpytest", "-Bqm pytest",
+            "-BW ignore -mpytest", "-BWignore -X dev -Bqm pytest",
+            "-BXutf8 -W ignore --check-hash-based-pycs always -mpytest",
+            "--check-hash-based-pycs never -BqW ignore -Xutf8 -m pytest",
+            "-m pytest.__main__",
+        ):
+            with self.subTest(options=options):
+                command = shlex.quote(sys.executable) + " " + options + " -q -p no:cacheprovider"
+                proc, text = self.run_check("--test-command", command)
+                self.assert_result(proc, text, passed=False)
+                self.assertIn("没有实际通过", text)
+
+        spec = importlib.util.spec_from_file_location("module_option_checker", SCRIPT)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        self.repo.write("pytest_driver.py", "print('pytest argument only')\n")
+        # 真实 Python 执行这些命令：-c / 文件入口之后，以及 -W / -X 参数中的 -m 都不是模块入口。
+        for options in (
+            ["-c", "print('pytest')", "-m", "pytest"],
+            ["-Bqc", "print('pytest')", "-mpytest"],
+            ["-BW", "-mpytest", "-c", "pass"],
+            ["-BX", "-mpytest", "-c", "pass"],
+            ["--check-hash-based-pycs", "always", "-c", "pass", "-mpytest"],
+            ["pytest_driver.py", "-m", "pytest"],
+            ["--", "pytest_driver.py", "-mpytest"],
+            ["-BqVmpytest"],
+        ):
+            with self.subTest(non_module_options=options):
+                run = checker.run_tests(shlex.join([sys.executable, *options]), [], self.repo.root)
+                self.assertEqual(run.code, 0, run.output)
+                self.assertFalse(run.junit, run.output)
+
     def test_failed_environment_install_does_not_run_or_count_as_failed_test(self):
         self.prepare_installed_source_change()
         for command in ("python -c 'raise SystemExit(13)'", "false | true\npython install_source.py"):

@@ -140,11 +140,30 @@ def is_pytest_command(cmd):
     index = 1
     while index < len(cmd):
         option = cmd[index]
-        if option == "-m":
-            return index + 1 < len(cmd) and cmd[index + 1] == "pytest"
-        if option in ("-c", "--") or not option.startswith("-"):
+        index += 1
+        if option == "--check-hash-based-pycs":
+            if index >= len(cmd) or cmd[index] not in ("always", "default", "never"):
+                return False
+            index += 1
+            continue
+        if not option.startswith("-") or option in ("-", "--") or option.startswith("--"):
             return False
-        index += 2 if option in ("-W", "-X", "--check-hash-based-pycs") else 1
+        # CPython 短选项可组合；c/m/W/X 消费本 token 剩余部分，或下一个完整 token。
+        for offset, flag in enumerate(option[1:], 1):
+            if flag in "cmWX":
+                argument = option[offset + 1:]
+                if not argument:
+                    if index >= len(cmd):
+                        return False
+                    argument = cmd[index]
+                    index += 1
+                if flag == "m":
+                    return argument in ("pytest", "pytest.__main__")
+                if flag == "c":
+                    return False
+                break
+            if flag not in "bBdEiIOPqRsStuvx":
+                return False  # 含帮助 / 版本、未知选项时 Python 不会运行后面的模块。
     return False
 
 
